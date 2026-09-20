@@ -1,0 +1,19 @@
+{
+  "name": "fast-jev-compaction-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Jev-guided, verbatim tool evidence compaction for Pi.",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
