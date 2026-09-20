@@ -1,11 +1,24 @@
 import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
-import { contentText, buildState, batchCalls, collectToolCalls, decideCall, estimateTokens, renderEvidence } from "./core.js";
+import {
+  contentText,
+  buildState,
+  batchCalls,
+  collectToolCalls,
+  decideCall,
+  estimateTokens,
+  mapWithConcurrency,
+  renderEvidence,
+} from "./core.js";
 import { askJev } from "./jev.js";
 
 const DEFAULTS = {
   keepThreshold: 0.5,
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
+  maxSummaryTokens: 12_000,
+  jevConcurrency: 3,
+  jevTimeoutMs: 20_000,
+  maxNarrativeTokens: 4_096,
   truncateHeadChars: 300,
   minEvidenceReduction: 0.25,
 };
@@ -15,13 +28,26 @@ function numberEnv(name: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const value = numberEnv(name, fallback);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function probabilityEnv(name: string, fallback: number): number {
+  const value = numberEnv(name, fallback);
+  return value >= 0 && value <= 1 ? value : fallback;
+}
+
 function settings() {
   return {
-    keepThreshold: numberEnv("FAST_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
-    maxStateTokens: Math.max(1, numberEnv("FAST_JEV_MAX_STATE_TOKENS", DEFAULTS.maxStateTokens)),
-    maxRequestTokens: Math.max(1, numberEnv("FAST_JEV_MAX_REQUEST_TOKENS", DEFAULTS.maxRequestTokens)),
+    keepThreshold: probabilityEnv("FAST_JEV_KEEP_THRESHOLD", DEFAULTS.keepThreshold),
+    maxStateTokens: positiveIntegerEnv("FAST_JEV_MAX_STATE_TOKENS", DEFAULTS.maxStateTokens),
+    maxRequestTokens: positiveIntegerEnv("FAST_JEV_MAX_REQUEST_TOKENS", DEFAULTS.maxRequestTokens),
+    maxSummaryTokens: positiveIntegerEnv("FAST_JEV_MAX_SUMMARY_TOKENS", DEFAULTS.maxSummaryTokens),
+    jevConcurrency: positiveIntegerEnv("FAST_JEV_CONCURRENCY", DEFAULTS.jevConcurrency),
+    jevTimeoutMs: positiveIntegerEnv("FAST_JEV_TIMEOUT_MS", DEFAULTS.jevTimeoutMs),
     truncateHeadChars: Math.max(0, Math.floor(numberEnv("FAST_JEV_TRUNCATE_HEAD_CHARS", DEFAULTS.truncateHeadChars))),
-    minEvidenceReduction: numberEnv("FAST_JEV_MIN_EVIDENCE_REDUCTION", DEFAULTS.minEvidenceReduction),
+    minEvidenceReduction: probabilityEnv("FAST_JEV_MIN_EVIDENCE_REDUCTION", DEFAULTS.minEvidenceReduction),
   };
 }
 
@@ -30,6 +56,7 @@ async function summarizeNarrative(
   previousSummary: string | undefined,
   ctx: ExtensionContext,
   signal: AbortSignal,
+  maxTokens: number,
 ): Promise<{ summary: string; usage: ReturnType<typeof ctx.modelRegistry.complete> extends Promise<infer T> ? T extends { usage: infer U } ? U : never : never }> {
   const model = ctx.model;
   if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
@@ -57,7 +84,7 @@ async function summarizeNarrative(
         },
       ],
     },
-    { maxTokens: 4096, signal, cacheRetention: "none" },
+    { maxTokens, signal, cacheRetention: "none" },
   );
   if (response.stopReason === "error" || response.stopReason === "length") {
     throw new Error(`narrative summary failed (${response.stopReason})`);
@@ -76,6 +103,10 @@ export default function (pi: ExtensionAPI) {
     if (!apiKey) return;
 
     const config = settings();
+    const summaryTokenBudget = Math.min(config.maxSummaryTokens, event.preparation.settings.reserveTokens);
+    const narrativeTokenBudget = Math.min(DEFAULTS.maxNarrativeTokens, summaryTokenBudget);
+    if (narrativeTokenBudget < 1 || summaryTokenBudget - narrativeTokenBudget < 2) return;
+
     const messages = [...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages];
     const calls = collectToolCalls(messages);
     if (calls.length === 0) return;
@@ -84,8 +115,10 @@ export default function (pi: ExtensionAPI) {
       const state = buildState(messages, calls, config.maxStateTokens);
       const batches = batchCalls(calls, estimateTokens(JSON.stringify(state)), config.maxRequestTokens);
       const answers = new Map<string, { keepCall: number; keepResult: number }>();
-      const batchAnswers = await Promise.all(
-        batches.map((batch) => askJev(fetch, apiKey, state, batch, event.signal)),
+      const batchAnswers = await mapWithConcurrency(
+        batches,
+        config.jevConcurrency,
+        (batch) => askJev(fetch, apiKey, state, batch, event.signal, config.jevTimeoutMs),
       );
       for (const batch of batchAnswers) {
         for (const [id, answer] of batch) answers.set(id, answer);
@@ -94,13 +127,23 @@ export default function (pi: ExtensionAPI) {
       const decisions = calls.map((call) =>
         decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, config.keepThreshold),
       );
-      const evidence = renderEvidence(calls, decisions, config.truncateHeadChars);
+      const narrative = await summarizeNarrative(
+        state,
+        event.preparation.previousSummary,
+        ctx,
+        event.signal,
+        narrativeTokenBudget,
+      );
+      const evidenceBudget = summaryTokenBudget - estimateTokens(narrative.summary) - 1;
+      const evidence = renderEvidence(calls, decisions, config.truncateHeadChars, evidenceBudget);
       if (!evidence.text || evidence.candidateChars === 0) return;
       const reduction = 1 - evidence.keptChars / evidence.candidateChars;
       if (reduction < config.minEvidenceReduction) return;
 
-      const narrative = await summarizeNarrative(state, event.preparation.previousSummary, ctx, event.signal);
       const summary = `${narrative.summary}\n\n${evidence.text}`;
+      if (estimateTokens(summary) > summaryTokenBudget) {
+        throw new Error("custom compaction exceeds its Pi-aligned summary budget");
+      }
       return {
         compaction: {
           summary,

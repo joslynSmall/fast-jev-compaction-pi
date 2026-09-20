@@ -4,6 +4,8 @@ import {
   buildState,
   collectToolCalls,
   decideCall,
+  estimateTokens,
+  mapWithConcurrency,
   renderEvidence,
   truncateResult,
   type MessageLike,
@@ -55,7 +57,7 @@ describe("Jev decision inputs", () => {
 
   it("batches questions without losing calls", () => {
     const calls = collectToolCalls(messages);
-    const batches = batchCalls(calls, 9_760, 10_000);
+    const batches = batchCalls(calls, 9_800, 10_000);
     expect(batches.flat().map((call) => call.id)).toEqual(["t1", "t2"]);
     expect(batches.length).toBeGreaterThan(1);
   });
@@ -85,5 +87,36 @@ describe("local policy", () => {
 
   it("keeps short results unchanged when truncation is unnecessary", () => {
     expect(truncateResult("short", false, 300)).toBe("short");
+  });
+
+  it("keeps rendered evidence within its token budget and prioritizes error results", () => {
+    const calls = collectToolCalls(messages);
+    const decisions = calls.map((call) => decideCall(call, { keepCall: 1, keepResult: 1 }, 0.5));
+    const evidence = renderEvidence(calls, decisions, 20, 60);
+    expect(estimateTokens(evidence.text)).toBeLessThanOrEqual(60);
+    expect(evidence.text).toContain("### bash (t2)");
+    expect(evidence.text).not.toContain("### read (t1)");
+  });
+
+  it("uses a fence longer than the evidence content", () => {
+    const calls = collectToolCalls(messages);
+    calls[0]!.result = "````\ncontent\n````";
+    const evidence = renderEvidence(calls, [decideCall(calls[0]!, { keepCall: 1, keepResult: 1 }, 0.5)], 20);
+    expect(evidence.text).toContain("`````text");
+    expect(evidence.text).toContain("\n`````");
+  });
+
+  it("bounds concurrent async work", async () => {
+    let active = 0;
+    let peak = 0;
+    const values = await mapWithConcurrency([1, 2, 3, 4, 5], 2, async (value) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return value * 2;
+    });
+    expect(values).toEqual([2, 4, 6, 8, 10]);
+    expect(peak).toBe(2);
   });
 });

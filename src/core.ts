@@ -55,8 +55,6 @@ export type JevState = {
   }>;
 };
 
-const TOKEN_PIECES = /[A-Za-z]+|\d+|[^\sA-Za-z\d]/g;
-
 export function contentText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -115,15 +113,8 @@ export function collectToolCalls(messages: readonly MessageLike[]): ToolCall[] {
 }
 
 export function estimateTokens(text: string): number {
-  let tokens = 0;
-  for (const [piece] of text.matchAll(TOKEN_PIECES)) {
-    const code = piece.charCodeAt(0);
-    if (code >= 48 && code <= 57) tokens += piece.length / 2;
-    else if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
-      tokens += 1 + Math.floor((piece.length - 1) / 6);
-    } else tokens += 0.9;
-  }
-  return Math.ceil(tokens);
+  // Match Pi's conservative compaction estimate so local limits compose with Pi's budget.
+  return Math.ceil(text.length / 4);
 }
 
 function truncate(text: string, limit: number): string {
@@ -259,43 +250,139 @@ export function truncateResult(text: string, isError: boolean, headChars: number
   }; re-run the tool if needed]`;
 }
 
+function jsonText(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return '"[unserializable input]"';
+  }
+}
+
+function fenceFor(text: string): string {
+  const longest = Math.max(0, ...Array.from(text.matchAll(/`+/g), (match) => match[0].length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+function evidenceSection(call: ToolCall, result: string): string {
+  const input = jsonText(call.input);
+  const inputFence = fenceFor(input);
+  const resultFence = fenceFor(result);
+  return [
+    `### ${call.tool} (${call.id})`,
+    "",
+    "Arguments:",
+    `${inputFence}json`,
+    input,
+    inputFence,
+    "",
+    `Result${call.isError ? " (error)" : ""}:`,
+    `${resultFence}text`,
+    result,
+    resultFence,
+  ].join("\n");
+}
+
+function renderWithinBudget(
+  call: ToolCall,
+  isFullResult: boolean,
+  headChars: number,
+  prefix: string,
+  selected: readonly string[],
+  maxTokens: number,
+): { section: string; result: string } | undefined {
+  const candidate = isFullResult
+    ? call.result
+    : truncateResult(call.result, call.isError, headChars);
+  const fits = (result: string) => {
+    const section = evidenceSection(call, result);
+    const text = [prefix, ...selected, section].join("\n\n");
+    return estimateTokens(text) <= maxTokens ? { section, result } : undefined;
+  };
+
+  const whole = fits(candidate);
+  if (whole) return whole;
+
+  let low = 0;
+  let high = Math.min(call.result.length, isFullResult ? call.result.length : headChars);
+  let best: { section: string; result: string } | undefined;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const rendered = fits(truncateResult(call.result, call.isError, mid));
+    if (rendered) {
+      best = rendered;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
+}
+
 export function renderEvidence(
   calls: readonly ToolCall[],
   decisions: readonly CallDecision[],
   headChars: number,
+  maxTokens = Number.POSITIVE_INFINITY,
 ): { text: string; candidateChars: number; keptChars: number } {
   const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
-  const sections: string[] = [];
+  const prefix = "## Verbatim Tool Evidence";
+  const sections = new Map<string, string>();
   let candidateChars = 0;
   let keptChars = 0;
 
-  for (const call of calls) {
-    candidateChars += call.result.length;
-    const decision = decisionById.get(call.id);
-    if (!decision || decision.action === "drop_call") continue;
-    const result =
-      decision.action === "keep"
-        ? call.result
-        : truncateResult(call.result, call.isError, headChars);
-    keptChars += result.length;
-    sections.push([
-      `### ${call.tool} (${call.id})`,
-      "",
-      "Arguments:",
-      "```json",
-      JSON.stringify(call.input, null, 2),
-      "```",
-      "",
-      `Result${call.isError ? " (error)" : ""}:`,
-      "````text",
-      result,
-      "````",
-    ].join("\n"));
+  for (const call of calls) candidateChars += call.result.length;
+
+  const selected = calls
+    .map((call, index) => ({ call, decision: decisionById.get(call.id), index }))
+    .filter((entry): entry is { call: ToolCall; decision: CallDecision; index: number } =>
+      entry.decision !== undefined && entry.decision.action !== "drop_call",
+    )
+    .sort((left, right) =>
+      Number(right.call.isError) - Number(left.call.isError)
+      || Number(right.decision.action === "keep") - Number(left.decision.action === "keep")
+      || left.index - right.index,
+    );
+
+  for (const { call, decision } of selected) {
+    const rendered = renderWithinBudget(
+      call,
+      decision.action === "keep",
+      headChars,
+      prefix,
+      Array.from(sections.values()),
+      maxTokens,
+    );
+    if (!rendered) continue;
+    sections.set(call.id, rendered.section);
+    keptChars += rendered.result.length;
   }
 
+  const orderedSections = calls.flatMap((call) => {
+    const section = sections.get(call.id);
+    return section ? [section] : [];
+  });
   return {
-    text: sections.length > 0 ? `## Verbatim Tool Evidence\n\n${sections.join("\n\n")}` : "",
+    text: orderedSections.length > 0 ? `${prefix}\n\n${orderedSections.join("\n\n")}` : "",
     candidateChars,
     keptChars,
   };
+}
+
+export async function mapWithConcurrency<T, U>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<U>,
+): Promise<U[]> {
+  const results = new Array<U>(values.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      results[index] = await mapper(values[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  return results;
 }

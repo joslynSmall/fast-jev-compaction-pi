@@ -7,8 +7,8 @@
 ## 代码与测试入口
 
 - [Pi 扩展入口](src/index.ts)：监听 `session_before_compact`，调用 Jev、生成普通文本摘要并写入自定义 compaction。
-- [本地决策核心](src/core.ts)：工具调用/结果配对、Jev state、问题分批、三态决策和原文证据渲染。
-- [Jev HTTP 客户端](src/jev.ts)：System One 请求构造及返回值校验。
+- [本地决策核心](src/core.ts)：工具调用/结果配对、Jev state、并发受限的问题分批、三态决策、证据预算和原文证据渲染。
+- [Jev HTTP 客户端](src/jev.ts)：System One 请求构造、超时及返回值校验。
 - [核心单元测试](test/core.test.ts)：配对、无工具输出 state、批处理、三态规则与截短渲染。
 - [Jev 协议测试](test/jev.test.ts)：双问题请求、认证头和非法回答拒绝。
 - [可复现基准脚本](scripts/benchmark.ts)：本地决策与证据渲染计时。
@@ -22,12 +22,12 @@ Pi 发起手动或自动上下文压缩时，本扩展监听 `session_before_com
 3. 对每一个调用向 Jev 提出两个 `noul` 概率问题：
    - `keepCall`：是否仍需知道该工具曾被调用及其参数。
    - `keepResult`：是否仍需保留完整、逐字的工具结果。
-4. 根据本地 `keepThreshold` 规则应用决策：
+4. 根据本地 `keepThreshold` 规则应用决策，并在最终 summary 预算内优先保留错误结果；预算不足时，完整保留会降级为截断或省略：
 
 | 条件 | 本地动作 |
 | --- | --- |
-| `keepResult >= keepThreshold` | 保留调用与完整原始结果。 |
-| `keepResult < keepThreshold` 且 `keepCall >= keepThreshold` | 保留调用，结果仅保留前缀和“可重新运行”提示。 |
+| `keepResult >= keepThreshold` | 优先保留调用与完整原始结果；summary 预算不足时降级为截断或省略。 |
+| `keepResult < keepThreshold` 且 `keepCall >= keepThreshold` | 保留调用，结果仅保留前缀和“可重新运行”提示；summary 预算不足时可能省略。 |
 | 两个概率都低于阈值 | 调用与结果都不写入压缩摘要。 |
 
 5. 使用当前 Pi 模型为普通会话文本生成结构化摘要，并附上 `## Verbatim Tool Evidence` 原文证据区块。
@@ -110,6 +110,9 @@ pi -e /absolute/path/to/fast-jev-compaction-pi/src/index.ts
 | `FAST_JEV_KEEP_THRESHOLD` | `0.5` | 调用或完整结果被保留的最低 Jev 概率。 |
 | `FAST_JEV_MAX_STATE_TOKENS` | `25000` | 发送给 Jev 的会话状态估算 token 上限。 |
 | `FAST_JEV_MAX_REQUEST_TOKENS` | `30000` | 一次 Jev 请求中状态和决策问题的估算 token 上限。 |
+| `FAST_JEV_MAX_SUMMARY_TOKENS` | `12000` | 自定义 summary 的 token 上限；实际预算还会受 Pi 当前 `reserveTokens` 限制。 |
+| `FAST_JEV_CONCURRENCY` | `3` | 并发 Jev HTTP 请求上限。 |
+| `FAST_JEV_TIMEOUT_MS` | `20000` | 单个 Jev HTTP 请求的超时毫秒数。 |
 | `FAST_JEV_TRUNCATE_HEAD_CHARS` | `300` | 仅保留调用时，结果原文保留的前缀字符数。 |
 | `FAST_JEV_MIN_EVIDENCE_REDUCTION` | `0.25` | 只有候选工具结果的字符缩减比例达到该值，才使用自定义压缩。 |
 
@@ -159,6 +162,7 @@ Received: 200
 - 没有可处理的已完成工具调用。
 - Jev 请求失败、返回非 JSON 或回答字段不完整。
 - 会话状态或决策问题超过配置的 token 预算。
+- 自定义 summary 无法同时满足 Pi 的 `reserveTokens` 与扩展自身的总预算。
 - 当前 Pi 模型无法生成普通文本摘要。
 - 筛选后工具证据的缩减比例低于 `FAST_JEV_MIN_EVIDENCE_REDUCTION`。
 
@@ -169,7 +173,7 @@ Received: 200
 - Pi 的扩展 API 只能写入一个 `compactionSummary`，保留的工具输出是 summary 内的原文区块，不是独立的 `toolResult` message。
 - 用户和助手的普通文本仍由当前 Pi 模型摘要，不保证逐字保留。
 - Jev 会收到摘要范围内的会话状态、工具名称、参数、结果长度和错误标记；工具输出正文不会进入 Jev 判定 state。
-- 在工具调用非常多的长会话中，决策问题可能拆分为多个并发 Jev 请求，完整状态会随每个批次重复发送。
+- 在工具调用非常多的长会话中，决策问题可能拆分为多个请求，完整状态会随每个批次重复发送；请求并发数受 `FAST_JEV_CONCURRENCY` 限制。
 
 ## 性能数据
 
@@ -183,19 +187,19 @@ Received: 200
 | --- | --- |
 | 运行环境 | Linux x64，Node.js `v22.22.0`，Pi `0.86.0`，npm `10.9.4` |
 | 样本 | `100` 个已完成工具调用；每个工具结果 `4,000` 字符；候选结果总计 `400,000` 字符 |
-| Jev state | `8,840` 估算 token；按 `30,000` token 请求上限为 `1` 个问题批次 |
+| Jev state | `4,184` 估算 token；按 `30,000` token 请求上限为 `1` 个问题批次 |
 | 决策分布 | `10%` 保留完整结果、`23%` 保留调用并截短结果、`67%` 删除调用 |
 | 循环次数 | `100` 次；同一进程内计时，使用 `performance.now()` |
 
 | 指标 | 结果 |
 | --- | ---: |
-| 本地路径最小耗时 | `0.593 ms` |
-| 本地路径中位数 | `1.145 ms` |
-| 本地路径 P95 | `3.072 ms` |
-| 本地路径最大耗时 | `12.132 ms` |
+| 本地路径最小耗时 | `0.447 ms` |
+| 本地路径中位数 | `1.052 ms` |
+| 本地路径 P95 | `2.064 ms` |
+| 本地路径最大耗时 | `5.665 ms` |
 | 输出证据字符缩减 | `87.05%`（`400,000` -> `51,793` 字符） |
 
-本结果表明该样本下的本地筛选与渲染成本很低；完整压缩的实际耗时仍主要取决于 Jev 网络/API 延迟和当前 Pi 模型的摘要延迟。不同硬件、Node 版本、会话文本长度、工具参数和 Jev 批次数会改变结果。
+所有 token 预算均使用 Pi 相同的保守 `字符数 / 4` 估算，以使扩展的状态、请求和最终 summary 限制与 Pi 的 compaction 预算一致。
 
 ### 复现方法
 
