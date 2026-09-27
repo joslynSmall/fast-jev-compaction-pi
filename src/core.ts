@@ -46,13 +46,23 @@ export type JevState = {
     i: number;
     role: string;
     text: string;
-    tool_calls?: Array<{
-      id: string;
-      tool: string;
-      input: string;
-      result: string;
-    }>;
+    tool_calls?: Array<
+      | {
+          id: string;
+          tool: string;
+          input: string;
+          result: string;
+        }
+      | string
+    >;
   }>;
+};
+
+export type FittedState = {
+  state: JevState;
+  tokens: number;
+  stage: string;
+  representedCalls: Set<string>;
 };
 
 export function contentText(content: unknown): string {
@@ -142,56 +152,210 @@ function goalFromMessages(messages: readonly MessageLike[]): string {
     .join("\n");
 }
 
-export function buildState(
+export function isPinned(index: number, total: number, preserveRecentMessages: number): boolean {
+  return index === 0 || index >= total - preserveRecentMessages;
+}
+
+function compactCallLine(call: ToolCall): string {
+  const input = Object.entries(call.input)
+    .map(([key, value]) => {
+      const text = typeof value === "string" ? value : inputText({ [key]: value }, 200);
+      return `${key}=${text.replace(/\s+/g, " ")}`;
+    })
+    .join(" ");
+  return truncate(`${call.id} ${call.tool} ${input} → ${call.isError ? "error" : "ok"} ${call.result.length}ch`, 60);
+}
+
+type HistoryEntry = JevState["history"][number];
+
+function representedCallIds(history: readonly HistoryEntry[]): Set<string> {
+  const ids = new Set<string>();
+  for (const entry of history) {
+    for (const call of entry.tool_calls ?? []) {
+      ids.add(typeof call === "string" ? (call.split(" ", 1)[0] ?? "") : call.id);
+    }
+  }
+  return ids;
+}
+
+function mergeCallRuns(history: readonly HistoryEntry[], pinned: (e: HistoryEntry) => boolean): HistoryEntry[] {
+  const merged: HistoryEntry[] = [];
+  for (const entry of history) {
+    const previous = merged[merged.length - 1];
+    const foldable = (e: HistoryEntry): boolean =>
+      !pinned(e) && e.text.length === 0 && typeof e.tool_calls?.[0] === "string";
+    if (previous && foldable(previous) && foldable(entry) && previous.role === entry.role) {
+      previous.tool_calls = [...(previous.tool_calls as string[]), ...(entry.tool_calls as string[])];
+      continue;
+    }
+    merged.push({ ...entry });
+  }
+  return merged;
+}
+
+/**
+ * Builds the Jev state and shrinks it in stages until it fits `maxTokens`:
+ * tool inputs are truncated, then long texts are abridged oldest-first, then
+ * old messages collapse to a one-line note, then old tool calls shrink to one
+ * line each, then old messages that carry no call are left out, then runs of
+ * old call-only messages are folded, and finally whole entries are left out
+ * oldest-first. Calls those entries carried are reported as unrepresented
+ * rather than scored blind, so the state always fits; only a state whose
+ * fixed envelope alone exceeds the limit throws.
+ */
+export function fitState(
   messages: readonly MessageLike[],
   calls: readonly ToolCall[],
   maxTokens: number,
-): JevState {
+  preserveRecentMessages = 0,
+  goal?: string,
+): FittedState {
   const byMessage = new Map<number, ToolCall[]>();
   for (const call of calls) {
     const group = byMessage.get(call.messageIndex) ?? [];
     group.push(call);
     byMessage.set(call.messageIndex, group);
   }
+  const resolvedGoal = goal || goalFromMessages(messages);
+  const context =
+    "A coding-agent history is being compacted. Tool outputs are omitted from this state. " +
+    "For each question, decide whether the call or its original result must remain available.";
+  const stateOf = (history: HistoryEntry[]): JevState => ({ context, goal: resolvedGoal, history });
+  const entryTokens = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 1;
+  const baseTokens = estimateTokens(JSON.stringify(stateOf([])));
+  const fitted = (history: HistoryEntry[], tokens: number, stage: string): FittedState => ({
+    state: stateOf(history),
+    tokens,
+    stage,
+    representedCalls: representedCallIds(history),
+  });
 
-  const makeState = (inputLimit: number, abridgeTexts: boolean): JevState => ({
-    context:
-      "A coding-agent history is being compacted. Tool outputs are omitted from this state. " +
-      "For each question, decide whether the call or its original result must remain available.",
-    goal: goalFromMessages(messages),
-    history: messages.flatMap((message, i) => {
+  const buildEntries = (inputLimit: number): HistoryEntry[] =>
+    messages.flatMap((message, i) => {
       if (message.role === "toolResult") return [];
       const callsForMessage = byMessage.get(i) ?? [];
       const text = contentText(message.content);
       if (text.trim().length === 0 && callsForMessage.length === 0) return [];
-      return [{
-        i,
-        role: message.role,
-        text: abridgeTexts ? abridge(text) : text,
-        ...(callsForMessage.length > 0
-          ? {
-              tool_calls: callsForMessage.map((call) => ({
-                id: call.id,
-                tool: call.tool,
-                input: inputText(call.input, inputLimit),
-                result: `${call.isError ? "error" : "ok"}, ${call.result.length} chars (omitted)`,
-              })),
-            }
-          : {}),
-      }];
-    }),
-  });
+      const entry: HistoryEntry = { i, role: message.role, text };
+      if (callsForMessage.length > 0) {
+        entry.tool_calls = callsForMessage.map((call) => ({
+          id: call.id,
+          tool: call.tool,
+          input: inputText(call.input, inputLimit),
+          result: `${call.isError ? "error" : "ok"}, ${call.result.length} chars (omitted)`,
+        }));
+      }
+      return [entry];
+    });
 
-  for (const [inputLimit, abridgeTexts] of [
-    [1000, false],
-    [200, false],
-    [60, false],
-    [60, true],
-  ] as const) {
-    const state = makeState(inputLimit, abridgeTexts);
-    if (estimateTokens(JSON.stringify(state)) <= maxTokens) return state;
+  let history: HistoryEntry[] = [];
+  let perEntry: number[] = [];
+  let tokens = 0;
+  const rebuild = (inputChars: number): void => {
+    history = buildEntries(inputChars);
+    perEntry = history.map(entryTokens);
+    tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
+  };
+  const fits = (): boolean => tokens <= maxTokens;
+  const shrink = (index: number, change: (entry: HistoryEntry) => void): void => {
+    const entry = history[index];
+    if (!entry) return;
+    change(entry);
+    const now = entryTokens(entry);
+    tokens += now - (perEntry[index] ?? 0);
+    perEntry[index] = now;
+  };
+
+  const INPUT_LIMITS = [1000, 200, 60] as const;
+  rebuild(INPUT_LIMITS[0]);
+  if (fits()) return fitted(history, tokens, "full");
+  for (const limit of INPUT_LIMITS.slice(1)) {
+    rebuild(limit);
+    if (fits()) return fitted(history, tokens, `inputs<=${limit}`);
   }
-  throw new Error(`Jev state exceeds ${maxTokens} tokens after truncation`);
+
+  const pinned = (entry: HistoryEntry): boolean => isPinned(entry.i, messages.length, preserveRecentMessages);
+  const indices = history.map((_, index) => index);
+  const order = [...indices.filter((index) => !pinned(history[index]!)), ...indices.filter((index) => pinned(history[index]!))];
+
+  for (const index of order) {
+    const entry = history[index]!;
+    if (entry.text.length <= 600) continue;
+    shrink(index, (e) => {
+      e.text = abridge(e.text);
+    });
+    if (fits()) return fitted(history, tokens, "texts abridged");
+  }
+
+  for (const index of order) {
+    const entry = history[index]!;
+    if (pinned(entry) || entry.text.length === 0) continue;
+    const original = contentText(messages[entry.i]?.content).length || entry.text.length;
+    shrink(index, (e) => {
+      e.text = `[… ${original} chars omitted …]`;
+    });
+    if (fits()) return fitted(history, tokens, "old messages collapsed");
+  }
+
+  for (const index of order) {
+    const entry = history[index]!;
+    const own = byMessage.get(entry.i);
+    if (pinned(entry) || !own) continue;
+    shrink(index, (e) => {
+      e.tool_calls = own.map(compactCallLine);
+    });
+    if (fits()) return fitted(history, tokens, "old calls compacted");
+  }
+
+  const left = new Set<number>();
+  for (const index of order) {
+    const entry = history[index]!;
+    if (pinned(entry) || entry.tool_calls) continue;
+    left.add(index);
+    tokens -= perEntry[index] ?? 0;
+    if (fits()) {
+      return fitted(
+        history.filter((_, i) => !left.has(i)),
+        tokens,
+        "old messages left out",
+      );
+    }
+  }
+
+  history = mergeCallRuns(
+    history.filter((_, i) => !left.has(i)),
+    pinned,
+  );
+  perEntry = history.map(entryTokens);
+  tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
+  if (fits()) return fitted(history, tokens, "old calls merged");
+
+  const dropOrder = [
+    ...history.map((_, index) => index).filter((index) => !pinned(history[index]!)),
+    ...history.map((_, index) => index).filter((index) => pinned(history[index]!)),
+  ];
+  const dropped = new Set<number>();
+  for (const index of dropOrder) {
+    dropped.add(index);
+    tokens -= perEntry[index] ?? 0;
+    if (fits()) {
+      return fitted(
+        history.filter((_, i) => !dropped.has(i)),
+        tokens,
+        "old entries left out",
+      );
+    }
+  }
+
+  throw new Error(`Jev state envelope alone is ~${tokens} tokens, over the ${maxTokens} limit`);
+}
+
+export function buildState(
+  messages: readonly MessageLike[],
+  calls: readonly ToolCall[],
+  maxTokens: number,
+): JevState {
+  return fitState(messages, calls, maxTokens).state;
 }
 
 export function questionsFor(call: ToolCall): Record<string, JevQuestion> {
@@ -205,6 +369,45 @@ export function questionsFor(call: ToolCall): Record<string, JevQuestion> {
       instructions: `The complete original result of tool call ${call.id} (${call.tool}, ${call.result.length} chars) should remain verbatim: its contents are still needed and rerunning the tool would not be sufficient.`,
     },
   };
+}
+
+/** Roughly 15k tokens of call metadata per window, inside Jev's 32k window. */
+export const DEFAULT_MAX_WINDOW_CHARS = 60_000;
+
+/**
+ * Splits calls into consecutive windows bounded by `maxChars` of estimated
+ * metadata, so each window's Jev state stays small and independently fittable.
+ * A single call larger than the window still forms its own window.
+ */
+export function splitIntoWindows(
+  calls: readonly ToolCall[],
+  maxChars: number,
+): ToolCall[][] {
+  const sizeOf = (call: ToolCall): number =>
+    JSON.stringify(call.input).length + call.tool.length + String(call.result.length).length + 32;
+  const windows: ToolCall[][] = [];
+  let current: ToolCall[] = [];
+  let size = 0;
+  for (const call of calls) {
+    const chars = sizeOf(call);
+    if (current.length > 0 && size + chars > maxChars) {
+      windows.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(call);
+    size += chars;
+  }
+  if (current.length > 0) windows.push(current);
+  return windows;
+}
+
+/**
+ * Folds per-window decisions into one list. Ids are already globally unique
+ * (`t1..tn` assigned once by `collectToolCalls`), so no prefixing is needed.
+ */
+export function mergeDecisions(windows: readonly (readonly CallDecision[])[]): CallDecision[] {
+  return windows.flat();
 }
 
 export function batchCalls(
@@ -289,10 +492,11 @@ function renderWithinBudget(
   prefix: string,
   selected: readonly string[],
   maxTokens: number,
+  spilled?: ReadonlyMap<string, string>,
 ): { section: string; result: string } | undefined {
   const candidate = isFullResult
     ? call.result
-    : truncateResult(call.result, call.isError, headChars);
+    : (spilled?.get(call.id) ?? truncateResult(call.result, call.isError, headChars));
   const fits = (result: string) => {
     const section = evidenceSection(call, result);
     const text = [prefix, ...selected, section].join("\n\n");
@@ -323,6 +527,7 @@ export function renderEvidence(
   decisions: readonly CallDecision[],
   headChars: number,
   maxTokens = Number.POSITIVE_INFINITY,
+  spilled?: ReadonlyMap<string, string>,
 ): { text: string; candidateChars: number; keptChars: number } {
   const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
   const prefix = "## Verbatim Tool Evidence";
@@ -351,6 +556,7 @@ export function renderEvidence(
       prefix,
       Array.from(sections.values()),
       maxTokens,
+      spilled,
     );
     if (!rendered) continue;
     sections.set(call.id, rendered.section);

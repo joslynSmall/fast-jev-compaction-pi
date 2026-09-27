@@ -1,15 +1,17 @@
 import type { ExtensionAPI, ExtensionContext, SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import {
-  contentText,
-  buildState,
   batchCalls,
   collectToolCalls,
+  contentText,
   decideCall,
   estimateTokens,
+  fitState,
   mapWithConcurrency,
   renderEvidence,
+  splitIntoWindows,
 } from "./core.js";
 import { askJev } from "./jev.js";
+import { isSpillNotice, spillPayload } from "./spill.js";
 
 const DEFAULTS = {
   keepThreshold: 0.5,
@@ -18,6 +20,7 @@ const DEFAULTS = {
   maxSummaryTokens: 12_000,
   jevConcurrency: 3,
   jevTimeoutMs: 20_000,
+  maxWindowChars: 60_000,
   maxNarrativeTokens: 4_096,
   truncateHeadChars: 300,
   minEvidenceReduction: 0.25,
@@ -46,13 +49,16 @@ function settings() {
     maxSummaryTokens: positiveIntegerEnv("FAST_JEV_MAX_SUMMARY_TOKENS", DEFAULTS.maxSummaryTokens),
     jevConcurrency: positiveIntegerEnv("FAST_JEV_CONCURRENCY", DEFAULTS.jevConcurrency),
     jevTimeoutMs: positiveIntegerEnv("FAST_JEV_TIMEOUT_MS", DEFAULTS.jevTimeoutMs),
+    maxWindowChars: positiveIntegerEnv("FAST_JEV_MAX_WINDOW_CHARS", DEFAULTS.maxWindowChars),
     truncateHeadChars: Math.max(0, Math.floor(numberEnv("FAST_JEV_TRUNCATE_HEAD_CHARS", DEFAULTS.truncateHeadChars))),
     minEvidenceReduction: probabilityEnv("FAST_JEV_MIN_EVIDENCE_REDUCTION", DEFAULTS.minEvidenceReduction),
   };
 }
 
+import type { JevState } from "./core.js";
+
 async function summarizeNarrative(
-  state: ReturnType<typeof buildState>,
+  state: JevState,
   previousSummary: string | undefined,
   ctx: ExtensionContext,
   signal: AbortSignal,
@@ -111,17 +117,45 @@ export default function (pi: ExtensionAPI) {
     const calls = collectToolCalls(messages);
     if (calls.length === 0) return;
 
+    let diag = "n/a";
     try {
-      const state = buildState(messages, calls, config.maxStateTokens);
-      const batches = batchCalls(calls, estimateTokens(JSON.stringify(state)), config.maxRequestTokens);
-      const answers = new Map<string, { keepCall: number; keepResult: number }>();
-      const batchAnswers = await mapWithConcurrency(
-        batches,
+      // Narrative + diagnostics use a state fitted over everything; it always
+      // fits now (fitState degrades instead of throwing) and never asks blind.
+      const fittedAll = fitState(messages, calls, config.maxStateTokens);
+      diag = `state=${fittedAll.tokens} stage=${fittedAll.stage} calls=${calls.length}`;
+      const state = fittedAll.state;
+      // Score per window so each Jev request carries a small state: a call the
+      // fitted window state had to leave out cannot be judged from it, so it
+      // stays unscored and keeps its output verbatim (fail safe, never blind).
+      const windows = splitIntoWindows(calls, config.maxWindowChars);
+      const perWindow = await mapWithConcurrency(
+        windows,
         config.jevConcurrency,
-        (batch) => askJev(fetch, apiKey, state, batch, event.signal, config.jevTimeoutMs),
+        async (window) => {
+          const fitted = windows.length > 1 ? fitState(messages, window, config.maxStateTokens) : fittedAll;
+          const scorable = window.filter((call) => fitted.representedCalls.has(call.id));
+          const batches = scorable.length > 0 ? batchCalls(scorable, fitted.tokens, config.maxRequestTokens) : [];
+          const answers = new Map<string, { keepCall: number; keepResult: number }>();
+          const batchAnswers = await mapWithConcurrency(
+            batches,
+            1,
+            (batch) => askJev(fetch, apiKey, fitted.state, batch, event.signal, config.jevTimeoutMs),
+          );
+          for (const batch of batchAnswers) {
+            for (const [id, answer] of batch) answers.set(id, answer);
+          }
+          return { answers, requests: batches.length, stateTokens: fitted.tokens, unscored: window.length - scorable.length };
+        },
       );
-      for (const batch of batchAnswers) {
-        for (const [id, answer] of batch) answers.set(id, answer);
+      const answers = new Map<string, { keepCall: number; keepResult: number }>();
+      let requests = 0;
+      let unscored = 0;
+      let maxWindowStateTokens = fittedAll.tokens;
+      for (const outcome of perWindow) {
+        for (const [id, answer] of outcome.answers) answers.set(id, answer);
+        requests += outcome.requests;
+        unscored += outcome.unscored;
+        maxWindowStateTokens = Math.max(maxWindowStateTokens, outcome.stateTokens);
       }
 
       const decisions = calls.map((call) =>
@@ -135,7 +169,26 @@ export default function (pi: ExtensionAPI) {
         narrativeTokenBudget,
       );
       const evidenceBudget = summaryTokenBudget - estimateTokens(narrative.summary) - 1;
-      const evidence = renderEvidence(calls, decisions, config.truncateHeadChars, evidenceBudget);
+      // Park dropped payloads on disk so truncation stays recoverable with one
+      // read. A read-only or full disk must not cost the turn: fall back to the
+      // inline note. `FAST_JEV_SPILL=0` restores the old inline-only behavior.
+      const spilled = new Map<string, string>();
+      if (process.env.FAST_JEV_SPILL !== "0") {
+        const decisionById = new Map(decisions.map((d) => [d.id, d]));
+        for (const call of calls) {
+          if (decisionById.get(call.id)?.action !== "drop_result") continue;
+          if (call.result.length <= config.truncateHeadChars + 120) continue;
+          if (isSpillNotice(call.result)) continue;
+          try {
+            const { notice } = spillPayload(call.result);
+            const head = config.truncateHeadChars > 0 ? `${call.result.slice(0, config.truncateHeadChars)}\n` : "";
+            spilled.set(call.id, `${head}${notice}`);
+          } catch {
+            continue;
+          }
+        }
+      }
+      const evidence = renderEvidence(calls, decisions, config.truncateHeadChars, evidenceBudget, spilled);
       if (!evidence.text || evidence.candidateChars === 0) return;
       const reduction = 1 - evidence.keptChars / evidence.candidateChars;
       if (reduction < config.minEvidenceReduction) return;
@@ -156,13 +209,18 @@ export default function (pi: ExtensionAPI) {
             candidateResultChars: evidence.candidateChars,
             evidenceChars: evidence.keptChars,
             evidenceReduction: reduction,
+            stateStage: fittedAll.stage,
+            stateTokens: fittedAll.tokens,
+            windows: windows.length,
+            requests,
+            unscored,
           },
         },
       };
     } catch (error) {
       if (!event.signal.aborted && ctx.hasUI) {
         const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`fast-jev-compaction-pi fallback: ${message}`, "warning");
+        ctx.ui.notify(`fast-jev-compaction-pi fallback: ${message} (${diag})`, "warning");
       }
       return;
     }

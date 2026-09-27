@@ -1,11 +1,11 @@
 import { performance } from "node:perf_hooks";
 import {
   batchCalls,
-  buildState,
   collectToolCalls,
   decideCall,
-  estimateTokens,
+  fitState,
   renderEvidence,
+  splitIntoWindows,
   type MessageLike,
 } from "../src/core.js";
 
@@ -65,22 +65,38 @@ const options = {
 const messages = fixture(options);
 const samples: number[] = [];
 let stateTokens = 0;
-let batches = 0;
+let stateStage = "";
+let windows = 0;
+let requests = 0;
+let unscored = 0;
 let candidateChars = 0;
 let evidenceChars = 0;
 
 for (let iteration = 0; iteration < options.iterations; iteration += 1) {
   const started = performance.now();
   const calls = collectToolCalls(messages);
-  const state = buildState(messages, calls, 25_000);
+  const fittedAll = fitState(messages, calls, 25_000);
+  const state = fittedAll.state;
+  const callWindows = splitIntoWindows(calls, 60_000);
+  let iterationRequests = 0;
+  let iterationUnscored = 0;
+  for (const window of callWindows) {
+    const fitted = callWindows.length > 1 ? fitState(messages, window, 25_000) : fittedAll;
+    const scorable = window.filter((call) => fitted.representedCalls.has(call.id));
+    iterationUnscored += window.length - scorable.length;
+    iterationRequests += scorable.length > 0 ? batchCalls(scorable, fitted.tokens, 30_000).length : 0;
+  }
   const decisions = calls.map((call, index) =>
     decideCall(call, { keepCall: index % 3 === 0 ? 0.9 : 0.1, keepResult: index % 10 === 0 ? 0.9 : 0.1 }, 0.5),
   );
   const evidence = renderEvidence(calls, decisions, 300);
   const elapsed = performance.now() - started;
   samples.push(elapsed);
-  stateTokens = estimateTokens(JSON.stringify(state));
-  batches = batchCalls(calls, stateTokens, 30_000).length;
+  stateTokens = fittedAll.tokens;
+  stateStage = fittedAll.stage;
+  windows = callWindows.length;
+  requests = iterationRequests;
+  unscored = iterationUnscored;
   candidateChars = evidence.candidateChars;
   evidenceChars = evidence.keptChars;
 }
@@ -97,7 +113,10 @@ console.log(JSON.stringify({
     resultCharsPerCall: options.resultChars,
     candidateResultChars: candidateChars,
     stateTokens,
-    requestBatchesAt30kTokenLimit: batches,
+    stateStage,
+    jevWindows: windows,
+    jevRequestsAt30kTokenLimit: requests,
+    unscoredCalls: unscored,
     iterations: options.iterations,
     decisions: "10% keep full result, 23% retain call with truncated result, 67% drop call",
   },

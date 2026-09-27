@@ -18,8 +18,8 @@
 Pi 发起手动或自动上下文压缩时，本扩展监听 `session_before_compact`：
 
 1. 用 Pi 的 `toolCall.id` 和 `toolResult.toolCallId` 配对已完成调用及其结果。
-2. 构造不含工具输出正文的会话状态：包含用户/助手文本、工具名称、参数、结果长度及错误标记。
-3. 对每一个调用向 Jev 提出两个 `noul` 概率问题：
+2. 构造不含工具输出正文的会话状态：包含用户/助手文本、工具名称、参数、结果长度及错误标记。状态按七级渐进降级直到装进 `FAST_JEV_MAX_STATE_TOKENS`（输入截短 → 长文本摘录 → 旧消息折叠 → 旧调用单行化 → 无调用旧消息丢弃 → 相邻纯调用条目合并 → 整条目按老丢弃），只剩固定 envelope 超限才放弃；被丢出状态的调用记为 unscored，其输出一律逐字保留，不做盲判。
+3. 按 `FAST_JEV_MAX_WINDOW_CHARS`（默认 60k 字符调用元数据）把调用分窗，每窗用自己的拟合状态分别向 Jev 提出两个 `noul` 概率问题：
    - `keepCall`：是否仍需知道该工具曾被调用及其参数。
    - `keepResult`：是否仍需保留完整、逐字的工具结果。
 4. 根据本地 `keepThreshold` 规则应用决策，并在最终 summary 预算内优先保留错误结果；预算不足时，完整保留会降级为截断或省略：
@@ -110,6 +110,9 @@ pi -e /absolute/path/to/fast-jev-compaction-pi/src/index.ts
 | `FAST_JEV_KEEP_THRESHOLD` | `0.5` | 调用或完整结果被保留的最低 Jev 概率。 |
 | `FAST_JEV_MAX_STATE_TOKENS` | `25000` | 发送给 Jev 的会话状态估算 token 上限。 |
 | `FAST_JEV_MAX_REQUEST_TOKENS` | `30000` | 一次 Jev 请求中状态和决策问题的估算 token 上限。 |
+| `FAST_JEV_MAX_WINDOW_CHARS` | `60000` | 每个 Jev 评分窗口的调用元数据字符上限；超大压缩区按此分窗独立评分后合并。 |
+| `FAST_JEV_SPILL` | 开启 | 设为 `0` 关闭落盘，被截断的工具输出只留 inline 提示，不再可恢复。 |
+| `FAST_JEV_SPILL_DIR` | `~/.pi/jev-spill/` | 被丢弃工具输出的落盘目录，同内容同文件复用。 |
 | `FAST_JEV_MAX_SUMMARY_TOKENS` | `12000` | 自定义 summary 的 token 上限；实际预算还会受 Pi 当前 `reserveTokens` 限制。 |
 | `FAST_JEV_CONCURRENCY` | `3` | 并发 Jev HTTP 请求上限。 |
 | `FAST_JEV_TIMEOUT_MS` | `20000` | 单个 Jev HTTP 请求的超时毫秒数。 |
@@ -161,19 +164,20 @@ Received: 200
 - `TYPESAFE_API_KEY` 未配置。
 - 没有可处理的已完成工具调用。
 - Jev 请求失败、返回非 JSON 或回答字段不完整。
-- 会话状态或决策问题超过配置的 token 预算。
+- 会话状态或决策问题超过配置的 token 预算（仅 envelope 自超或单个问题超预算时；普通超大历史会走降级与分窗，不再直接回退）。
 - 自定义 summary 无法同时满足 Pi 的 `reserveTokens` 与扩展自身的总预算。
 - 当前 Pi 模型无法生成普通文本摘要。
 - 筛选后工具证据的缩减比例低于 `FAST_JEV_MIN_EVIDENCE_REDUCTION`。
 
-这意味着该扩展优化的是工具证据保留质量，而不接管 Pi 的可靠性边界。
+这意味着该扩展优化的是工具证据保留质量，而不接管 Pi 的可靠性边界。回退通知会带上诊断（`state/stage/calls`），成功时的 `details` 会带上 `stateStage/stateTokens/windows/requests/unscored`，方便调参。
 
 ## 已知限制
 
 - Pi 的扩展 API 只能写入一个 `compactionSummary`，保留的工具输出是 summary 内的原文区块，不是独立的 `toolResult` message。
 - 用户和助手的普通文本仍由当前 Pi 模型摘要，不保证逐字保留。
 - Jev 会收到摘要范围内的会话状态、工具名称、参数、结果长度和错误标记；工具输出正文不会进入 Jev 判定 state。
-- 在工具调用非常多的长会话中，决策问题可能拆分为多个请求，完整状态会随每个批次重复发送；请求并发数受 `FAST_JEV_CONCURRENCY` 限制。
+- 在工具调用非常多的长会话中，决策问题按 `FAST_JEV_MAX_WINDOW_CHARS` 分窗，每个窗口用自己的拟合状态独立请求；请求并发数受 `FAST_JEV_CONCURRENCY` 限制。
+- 被截断的工具输出默认落盘到 `~/.pi/jev-spill/<hash>.txt`（`FAST_JEV_SPILL=0` 关闭），证据区只留前缀 + 文件路径，一次 `read` 即可找回；同内容复用同一文件，磁盘只写失败时自动回退到 inline 提示。
 
 ## 性能数据
 
