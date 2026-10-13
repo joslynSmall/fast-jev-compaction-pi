@@ -79,7 +79,7 @@ async function summarizeNarrative(
     JSON.stringify(state),
     "</compaction-state>",
   ].join("\n");
-  const response = await ctx.modelRegistry.complete(
+  const response = await ctx.modelRegistry.streamSimple(
     model,
     {
       messages: [
@@ -90,10 +90,20 @@ async function summarizeNarrative(
         },
       ],
     },
-    { maxTokens, signal, cacheRetention: "none" },
-  );
+    {
+      maxTokens: Math.min(maxTokens, model.maxTokens > 0 ? model.maxTokens : maxTokens),
+      signal,
+      cacheRetention: "none",
+    },
+  ).result();
+  if (signal.aborted || response.stopReason === "aborted") {
+    throw new Error("narrative summary aborted");
+  }
   if (response.stopReason === "error" || response.stopReason === "length") {
-    throw new Error(`narrative summary failed (${response.stopReason})`);
+    const detail = response.errorMessage || (response.stopReason === "length"
+      ? "generation hit the token cap and the summary is incomplete"
+      : "provider returned no error detail");
+    throw new Error(`narrative summary failed (${response.stopReason}): ${detail}`);
   }
   if (response.content.some((block) => block.type === "toolCall")) {
     throw new Error("narrative summary attempted a tool call");

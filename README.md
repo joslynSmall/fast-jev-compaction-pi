@@ -171,6 +171,14 @@ Received: 200
 
 这意味着该扩展优化的是工具证据保留质量，而不接管 Pi 的可靠性边界。回退通知会带上诊断（`state/stage/calls`），成功时的 `details` 会带上 `stateStage/stateTokens/windows/requests/unscored`，方便调参。
 
+普通文本摘要通过 Pi 的 `modelRegistry.streamSimple()` 生成，沿用当前模型及 Pi 的认证解析；输出上限同时受摘要预算与模型的 `maxTokens` 限制。服务端失败会保留 `errorMessage`，例如：
+
+```text
+fast-jev-compaction-pi fallback: narrative summary failed (error): server_error: connection lost mid-reply (unexpected EOF) (state=11041 stage=inputs<=200 calls=108)
+```
+
+这里 `state` 是拟合状态的估算 token 数，`stage` 是状态降级阶段，`calls` 是已配对工具调用数；它们不表示摘要请求失败的原因。应优先查看 `failed (error)` 后的服务端错误。输出达到 token 上限或请求取消时，部分摘要不会写入 compaction；用户取消压缩时不额外弹出 fallback 警告。
+
 ## 已知限制
 
 - Pi 的扩展 API 只能写入一个 `compactionSummary`，保留的工具输出是 summary 内的原文区块，不是独立的 `toolResult` message。
